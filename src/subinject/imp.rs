@@ -28,9 +28,22 @@
 //! This element owns exactly one thing: turning a timestamped string into a
 //! correctly framed FLV tag at the right point in a byte stream.
 //!
-//! In particular, a cue whose text is empty is *not* filtered out here. An
-//! empty cue is the transport's clear-display signal, and suppressing it would
-//! silently strand the previous caption on screen forever.
+//! In particular, a cue whose text is empty is *not* filtered out here: a
+//! caller that wants to signal "clear the display" must be able to, and
+//! suppressing it would silently strand the previous caption on screen.
+//!
+//! Be aware that this is not yet an end-to-end contract. FLV script data has
+//! no explicit erase, so "clear" can only be expressed as a cue that renders
+//! as nothing — and a consumer republishing these cues as WebVTT is obliged to
+//! reject empty cue text, because a blank body terminates a WebVTT cue. So an
+//! empty cue forwarded from here can fail such a consumer rather than clear
+//! its display. That is why priming uses U+200B rather than `""`.
+//!
+//! Today nothing exercises this: `textrollup` clears its window by emitting a
+//! GAP event, not an empty buffer, so empty cues do not occur in the pipeline
+//! this element was built for. Wiring a real clear signal end to end needs the
+//! consumer to treat an empty text cue as "close the open cue and publish
+//! nothing" — see README.
 
 use std::sync::Mutex;
 
@@ -213,6 +226,19 @@ impl FlvSubInject {
       }
     };
 
+    // AMF0 short strings cap at 64KB and `script_data_body` truncates to fit.
+    // Silent truncation is a data-loss path, so it is surfaced here where the
+    // original length is still known.
+    if text.len() > crate::amf::MAXIMUM_TEXT_BYTES {
+      gst::warning!(
+        CAT,
+        imp = self,
+        "cue text of {} bytes exceeds the {}-byte AMF0 string limit and will be truncated",
+        text.len(),
+        crate::amf::MAXIMUM_TEXT_BYTES
+      );
+    }
+
     let mut state = self.state.lock().unwrap();
     let running_time = State::running_time(state.text_segment.as_ref(), pts);
     gst::log!(
@@ -300,6 +326,46 @@ impl FlvSubInject {
       self.src.push(tag)?;
     }
     Ok(gst::FlowSuccess::Ok)
+  }
+
+  /// Write every queued cue before the FLV stream ends.
+  ///
+  /// Runs on the FLV streaming thread, from the EOS handler, so it preserves
+  /// the single-writer invariant: EOS arrives on the same pad and thread that
+  /// pushes buffers, and no chain call can be in flight beside it.
+  ///
+  /// Cues are clamped to the final stream position rather than kept at their
+  /// own timestamps. A cue beyond the last media tag has no frame to sit
+  /// against, and a consumer resolving a cue's end from its successor would
+  /// otherwise be handed a cue that starts after the stream stopped.
+  fn flush_pending_at_eos(&self) {
+    let tags = {
+      let mut state = self.state.lock().unwrap();
+      if state.pending.is_empty() {
+        return;
+      }
+      let position = state.stream_position_ms;
+      let message_name = MessageName::from(self.settings.lock().unwrap().message_name);
+      let pending = std::mem::take(&mut state.pending);
+      gst::debug!(
+        CAT,
+        imp = self,
+        "draining {} queued cue(s) at EOS position {position}ms",
+        pending.len()
+      );
+      state.written += pending.len() as u64;
+      pending
+        .into_iter()
+        .map(|cue| {
+          let body = script_data_body(message_name, &cue.text, None);
+          gst::Buffer::from_mut_slice(script_data_tag(position, &body))
+        })
+        .collect::<Vec<_>>()
+    };
+
+    if let Err(error) = self.push_tags(tags) {
+      gst::debug!(CAT, imp = self, "EOS cue drain failed: {error}");
+    }
   }
 
   /// Forward FLV bytes, splicing queued cues at tag boundaries.
@@ -452,10 +518,42 @@ impl ObjectSubclass for FlvSubInject {
           parent,
           || false,
           |this| {
-            if let gst::EventView::Segment(segment) = event.view()
-              && let Some(segment) = segment.segment().downcast_ref::<gst::ClockTime>()
-            {
-              this.state.lock().unwrap().flv_segment = Some(segment.clone());
+            use gst::EventView;
+            match event.view() {
+              EventView::Segment(segment) => {
+                if let Some(segment) = segment.segment().downcast_ref::<gst::ClockTime>() {
+                  this.state.lock().unwrap().flv_segment = Some(segment.clone());
+                }
+              }
+              EventView::Eos(_) => {
+                // Cues still queued belong to media that was published, so they
+                // are written before the stream ends rather than discarded with
+                // the element.
+                //
+                // The text and FLV branches run on independent threads, so the
+                // transcriber's final flush can land after the muxer has already
+                // finished. Dropping here loses the last caption of every
+                // session, and does it invisibly. `tttocea708` handles the same
+                // case by erasing the display at EOS.
+                this.flush_pending_at_eos();
+              }
+              EventView::FlushStop(_) => {
+                // A flush discards the timeline both sides were measured
+                // against. Keeping `origin` or `stream_position_ms` across one
+                // would place every subsequent cue against a stale reference,
+                // and keeping `pending` would emit cues for media that is no
+                // longer being sent.
+                //
+                // Settings are deliberately not reset: they are configuration,
+                // not stream state.
+                let mut state = this.state.lock().unwrap();
+                let dropped = state.pending.len();
+                *state = State::default();
+                if dropped > 0 {
+                  gst::debug!(CAT, imp = this, "flush discarded {dropped} queued cue(s)");
+                }
+              }
+              _ => {}
             }
             gst::Pad::event_default(pad, Some(&*this.obj()), event)
           },
