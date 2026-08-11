@@ -26,9 +26,15 @@ simply be spliced between two existing tags, which is all this element does.
 More precisely, the muxers emit **exactly one whole FLV tag per buffer**, with
 the running time of the media it carries in `GST_BUFFER_PTS`. So this element
 does not parse the byte stream at all: it reads the timestamp the muxer already
-computed and forwards the buffer untouched. The invariant is checked at
-runtime, and a buffer that is not one whole tag produces a warning rather than
-a silent misplacement.
+computed and forwards the buffer untouched.
+
+That invariant is asserted directly against **both** `flvmux` and `eflvmux`
+(`every_muxer_buffer_is_exactly_one_tag`), with audio and video interleaved and
+through a `queue`, since those are the conditions under which buffers would
+plausibly be merged. It is also checked at runtime: a buffer that is not one
+whole tag warns rather than silently misplacing cues, on the first violation
+and periodically after that, so a continuous fault stays visible without
+flooding the log.
 
 Sitting after the muxer has a second consequence that matters more than the
 convenience: **the text path never enters an aggregator.** `cccombiner` and
@@ -173,6 +179,13 @@ Unit tests assert the byte layout against the specification. The round-trip
 tests in `tests/roundtrip.rs` assert it against the reader that matters, by
 muxing a real stream and requiring `ffmpeg` to demux the cues back at their
 original timestamps.
+
+Both the round-trip and ordering suites run against `flvmux` **and** `eflvmux`.
+Production publishes Enhanced FLV, so covering only the classic muxer would
+leave the one that actually runs untested; they are separate implementations
+(`gstflvmux.c` and `gsteflvmux.c`) and this element depends on a property of
+their output. A muxer missing from the local GStreamer build is skipped with a
+printed notice rather than passing silently.
 
 ### A pre-existing hazard the tests filter
 

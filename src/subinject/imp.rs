@@ -128,6 +128,12 @@ impl Default for Settings {
 /// renders as nothing for every viewer that sees it.
 const PRIMING_TEXT: &str = "\u{200b}";
 
+/// How often to repeat the one-tag-per-buffer warning once it starts firing.
+///
+/// The first violation is always logged; after that one line per this many
+/// keeps a continuous fault visible without flooding at buffer rate.
+const INVARIANT_WARNING_INTERVAL: u64 = 1_000;
+
 /// A cue waiting for the FLV stream to reach its timestamp.
 #[derive(Clone, Debug)]
 struct PendingCue {
@@ -180,8 +186,8 @@ pub struct FlvSubInject {
   src: gst::Pad,
   settings: Mutex<Settings>,
   state: Mutex<State>,
-  /// Whether the one-tag-per-buffer warning has already been emitted.
-  invariant_warned: std::sync::atomic::AtomicBool,
+  /// How many buffers have violated the one-tag-per-buffer invariant.
+  invariant_violations: std::sync::atomic::AtomicU64,
 }
 
 impl FlvSubInject {
@@ -468,28 +474,34 @@ impl FlvSubInject {
   /// silent fallback is what would make the resulting mistimed captions hard
   /// to trace back to their cause.
   fn check_one_tag_per_buffer(&self, buffer: &gst::Buffer) {
-    if self.invariant_warned.load(std::sync::atomic::Ordering::Relaxed) {
-      return;
-    }
-    let Ok(map) = buffer.map_readable() else {
-      return;
-    };
     // Stream headers are concatenated small blocks rather than single tags,
     // and carry no PTS; they are forwarded untouched and are not covered.
     if buffer.pts().is_none() {
       return;
     }
+    let Ok(map) = buffer.map_readable() else {
+      return;
+    };
     let matches_one_tag = crate::flv::parse_tag_header(map.as_slice())
       .is_some_and(|header| header.total_len() == map.size());
-    if !matches_one_tag {
-      self
-        .invariant_warned
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    if matches_one_tag {
+      return;
+    }
+
+    // Throttled rather than latched. Logging every violation would flood at
+    // buffer rate, but logging only the first hides whether the problem was a
+    // single malformed buffer or is continuous — and that distinction is the
+    // whole diagnostic value when captions come out misplaced.
+    let seen = self
+      .invariant_violations
+      .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+      + 1;
+    if seen == 1 || seen % INVARIANT_WARNING_INTERVAL == 0 {
       gst::warning!(
         CAT,
         imp = self,
-        "buffer of {} bytes is not exactly one FLV tag; cue placement assumes \
-         one tag per buffer and may be misaligned",
+        "buffer of {} bytes is not exactly one FLV tag ({seen} so far); cue \
+         placement assumes one tag per buffer and may be misaligned",
         map.size()
       );
     }
@@ -606,7 +618,7 @@ impl ObjectSubclass for FlvSubInject {
       src,
       settings: Mutex::new(Settings::default()),
       state: Mutex::new(State::default()),
-      invariant_warned: std::sync::atomic::AtomicBool::new(false),
+      invariant_violations: std::sync::atomic::AtomicU64::new(0),
     }
   }
 }

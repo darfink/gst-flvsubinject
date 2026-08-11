@@ -26,6 +26,22 @@ fn init() {
   });
 }
 
+/// Both FLV muxers this element is expected to sit behind.
+///
+/// Production publishes Enhanced FLV through `eflvmux`; covering only the
+/// classic `flvmux` would leave the concurrency behaviour of the muxer that
+/// actually runs untested.
+const MUXERS: [&str; 2] = ["flvmux", "eflvmux"];
+
+fn muxer_available(name: &str) -> bool {
+  init();
+  if gst::ElementFactory::find(name).is_some() {
+    return true;
+  }
+  eprintln!("skipping {name}: not present in this GStreamer build");
+  false
+}
+
 /// Every tag timestamp in an FLV byte stream, in the order written.
 fn tag_timestamps(flv: &[u8]) -> Vec<(u8, u32)> {
   let mut cursor = 9 + 4;
@@ -45,7 +61,7 @@ fn tag_timestamps(flv: &[u8]) -> Vec<(u8, u32)> {
 /// The text appsrc is driven from its own thread with `is-live=false`, which
 /// is how the transcode pipeline feeds it: an AppBridge consumer runs its own
 /// streaming thread, independent of the one carrying muxed FLV.
-fn run_concurrent(cue_count: u64) -> Vec<u8> {
+fn run_concurrent(muxer: &str, cue_count: u64) -> Vec<u8> {
   init();
 
   let pipeline = gst::Pipeline::new();
@@ -60,7 +76,7 @@ fn run_concurrent(cue_count: u64) -> Vec<u8> {
     .build()
     .unwrap();
   let parser = gst::ElementFactory::make("h264parse").build().unwrap();
-  let mux = gst::ElementFactory::make("flvmux")
+  let mux = gst::ElementFactory::make(muxer)
     .property("streamable", true)
     .build()
     .unwrap();
@@ -145,32 +161,46 @@ fn tag_framing_survives_concurrent_text_and_flv_threads() {
   // another tag's body does not corrupt one caption: it desynchronizes the
   // tag stream, and every byte after it is garbage. A consumer sees EBML-style
   // nonsense rather than a missing cue.
-  let flv = run_concurrent(60);
-  assert!(!flv.is_empty(), "no output produced");
+  for muxer in MUXERS {
+    if !muxer_available(muxer) {
+      continue;
+    }
+    let flv = run_concurrent(muxer, 60);
+    assert!(!flv.is_empty(), "{muxer}: no output produced");
 
-  let tags = tag_timestamps(&flv);
-  assert!(tags.len() > 10, "only {} tags parsed", tags.len());
+    let tags = tag_timestamps(&flv);
+    assert!(tags.len() > 10, "{muxer}: only {} tags parsed", tags.len());
 
-  // Walking the whole stream by header length and landing exactly on the end
-  // is the check: it can only succeed if every tag boundary is intact.
-  let mut cursor = 9 + 4;
-  for (index, _) in tags.iter().enumerate() {
-    let header = parse_tag_header(&flv[cursor..])
-      .unwrap_or_else(|| panic!("tag {index} has an unparseable header"));
-    cursor += header.total_len();
+    // Walking the whole stream by header length and landing exactly on the end
+    // is the check: it can only succeed if every tag boundary is intact.
+    let mut cursor = 9 + 4;
+    for (index, _) in tags.iter().enumerate() {
+      let header = parse_tag_header(&flv[cursor..])
+        .unwrap_or_else(|| panic!("{muxer}: tag {index} has an unparseable header"));
+      cursor += header.total_len();
+    }
+    assert_eq!(
+      cursor,
+      flv.len(),
+      "{muxer}: tag stream does not end on a boundary: framing was corrupted"
+    );
   }
-  assert_eq!(
-    cursor,
-    flv.len(),
-    "tag stream does not end on a boundary: framing was corrupted"
-  );
 }
 
 #[test]
 fn script_data_timestamps_never_regress() {
   // Ordering, as distinct from framing. A consumer that trusts tag order will
   // mis-time captions if a cue is written after a later-timestamped A/V tag.
-  let flv = run_concurrent(60);
+  for muxer in MUXERS {
+    if !muxer_available(muxer) {
+      continue;
+    }
+    assert_no_regressions(muxer);
+  }
+}
+
+fn assert_no_regressions(muxer: &str) {
+  let flv = run_concurrent(muxer, 60);
   let tags = tag_timestamps(&flv);
 
   let mut highest = 0u32;
@@ -184,7 +214,7 @@ fn script_data_timestamps_never_regress() {
 
   assert!(
     regressions.is_empty(),
-    "{} tags went backwards in time, first: {:?}",
+    "{muxer}: {} tags went backwards in time, first: {:?}",
     regressions.len(),
     regressions.first()
   );
@@ -193,7 +223,7 @@ fn script_data_timestamps_never_regress() {
     .iter()
     .filter(|(tag_type, _)| *tag_type == TAG_TYPE_SCRIPT_DATA)
     .count();
-  assert!(script_tags > 0, "no cues were written at all");
+  assert!(script_tags > 0, "{muxer}: no cues were written at all");
 }
 
 #[test]
@@ -206,17 +236,26 @@ fn every_cue_is_written_between_two_whole_tags() {
   // asserting that script tags appear at boundaries makes the intent explicit,
   // so a future change that reintroduces a second writer fails here with a
   // readable message rather than as "stream ends mid-tag".
-  let flv = run_concurrent(80);
+  for muxer in MUXERS {
+    if !muxer_available(muxer) {
+      continue;
+    }
+    assert_cues_land_on_boundaries(muxer);
+  }
+}
+
+fn assert_cues_land_on_boundaries(muxer: &str) {
+  let flv = run_concurrent(muxer, 80);
   let mut cursor = 9 + 4;
   let mut script_tags = 0;
 
   while cursor < flv.len() {
     let Some(header) = parse_tag_header(&flv[cursor..]) else {
-      panic!("unparseable tag header at byte {cursor} of {}", flv.len());
+      panic!("{muxer}: unparseable tag header at byte {cursor} of {}", flv.len());
     };
     assert!(
       flv.len() - cursor >= header.total_len(),
-      "tag at byte {cursor} claims {} bytes but only {} remain",
+      "{muxer}: tag at byte {cursor} claims {} bytes but only {} remain",
       header.total_len(),
       flv.len() - cursor
     );
@@ -226,6 +265,6 @@ fn every_cue_is_written_between_two_whole_tags() {
     cursor += header.total_len();
   }
 
-  assert_eq!(cursor, flv.len(), "stream does not end on a tag boundary");
-  assert!(script_tags > 0, "no cues were written at all");
+  assert_eq!(cursor, flv.len(), "{muxer}: stream does not end on a tag boundary");
+  assert!(script_tags > 0, "{muxer}: no cues were written at all");
 }

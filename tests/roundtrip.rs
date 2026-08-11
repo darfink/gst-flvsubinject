@@ -25,6 +25,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use gst::prelude::*;
+use gstflvsubinject::flv::parse_tag_header;
 
 fn init() {
   use std::sync::Once;
@@ -33,6 +34,30 @@ fn init() {
     gst::init().unwrap();
     gstflvsubinject::plugin_register_static().unwrap();
   });
+}
+
+/// The FLV muxers this element is expected to sit behind.
+///
+/// Production publishes Enhanced FLV through `eflvmux`, so testing only the
+/// classic `flvmux` would leave the muxer that actually runs uncovered. They
+/// are separate implementations in the same plugin — `gstflvmux.c` and
+/// `gsteflvmux.c` — and this element depends on a property of their *output*
+/// (one whole tag per buffer), so the property is asserted for each rather
+/// than assumed to transfer.
+const MUXERS: [&str; 2] = ["flvmux", "eflvmux"];
+
+/// Whether a muxer is present in this GStreamer build.
+///
+/// `eflvmux` arrived in 1.28; skipping rather than failing keeps the suite
+/// usable on older toolchains, and the skip is announced so a silent pass
+/// cannot be mistaken for coverage.
+fn muxer_available(name: &str) -> bool {
+  init();
+  if gst::ElementFactory::find(name).is_some() {
+    return true;
+  }
+  eprintln!("skipping {name}: not present in this GStreamer build");
+  false
 }
 
 fn ffprobe_available() -> bool {
@@ -45,11 +70,11 @@ fn ffprobe_available() -> bool {
 }
 
 /// Mux a short A/V stream and inject cues, returning the FLV bytes.
-fn produce_flv(cues: &[(u64, &str)]) -> Vec<u8> {
-  produce_flv_with(cues, true)
+fn produce_flv(muxer: &str, cues: &[(u64, &str)]) -> Vec<u8> {
+  produce_flv_with(muxer, cues, true)
 }
 
-fn produce_flv_with(cues: &[(u64, &str)], prime: bool) -> Vec<u8> {
+fn produce_flv_with(muxer: &str, cues: &[(u64, &str)], prime: bool) -> Vec<u8> {
   init();
 
   let pipeline = gst::Pipeline::new();
@@ -65,7 +90,7 @@ fn produce_flv_with(cues: &[(u64, &str)], prime: bool) -> Vec<u8> {
     .build()
     .unwrap();
   let parser = gst::ElementFactory::make("h264parse").build().unwrap();
-  let mux = gst::ElementFactory::make("flvmux")
+  let mux = gst::ElementFactory::make(muxer)
     .property("streamable", true)
     .build()
     .unwrap();
@@ -129,7 +154,7 @@ fn produce_flv_with(cues: &[(u64, &str)], prime: bool) -> Vec<u8> {
 }
 
 /// The same A/V pipeline with no injector at all, as a transparency baseline.
-fn produce_flv_without_element() -> Vec<u8> {
+fn produce_flv_without_element(muxer: &str) -> Vec<u8> {
   init();
 
   let pipeline = gst::Pipeline::new();
@@ -144,7 +169,7 @@ fn produce_flv_without_element() -> Vec<u8> {
     .build()
     .unwrap();
   let parser = gst::ElementFactory::make("h264parse").build().unwrap();
-  let mux = gst::ElementFactory::make("flvmux")
+  let mux = gst::ElementFactory::make(muxer)
     .property("streamable", true)
     .build()
     .unwrap();
@@ -224,23 +249,24 @@ fn ffmpeg_demuxes_injected_cues_at_their_timestamps() {
     return;
   }
 
-  let flv = produce_flv(&[(0, "first cue"), (500, "second cue"), (1000, "third cue")]);
-  assert!(!flv.is_empty(), "pipeline produced no FLV bytes");
+  for muxer in MUXERS {
+    if !muxer_available(muxer) {
+      continue;
+    }
+    let flv = produce_flv(muxer, &[(0, "first cue"), (500, "second cue"), (1000, "third cue")]);
+    assert!(!flv.is_empty(), "{muxer} produced no FLV bytes");
 
-  let cues = ffprobe_cues(&flv);
-  assert_eq!(
-    cues.len(),
-    3,
-    "expected three demuxed cues, got {cues:?}"
-  );
-  assert_eq!(cues[0].1, "first cue");
-  assert_eq!(cues[1].1, "second cue");
-  assert_eq!(cues[2].1, "third cue");
+    let cues = ffprobe_cues(&flv);
+    assert_eq!(cues.len(), 3, "{muxer}: expected three demuxed cues, got {cues:?}");
+    assert_eq!(cues[0].1, "first cue", "{muxer}");
+    assert_eq!(cues[1].1, "second cue", "{muxer}");
+    assert_eq!(cues[2].1, "third cue", "{muxer}");
 
-  // Timestamps must survive the round trip, not merely the text.
-  assert!(cues[0].0.abs() <= 40, "first cue at {}ms", cues[0].0);
-  assert!((cues[1].0 - 500).abs() <= 40, "second cue at {}ms", cues[1].0);
-  assert!((cues[2].0 - 1000).abs() <= 40, "third cue at {}ms", cues[2].0);
+    // Timestamps must survive the round trip, not merely the text.
+    assert!(cues[0].0.abs() <= 40, "{muxer}: first cue at {}ms", cues[0].0);
+    assert!((cues[1].0 - 500).abs() <= 40, "{muxer}: second cue at {}ms", cues[1].0);
+    assert!((cues[2].0 - 1000).abs() <= 40, "{muxer}: third cue at {}ms", cues[2].0);
+  }
 }
 
 #[test]
@@ -250,19 +276,24 @@ fn an_empty_cue_survives_as_a_clear_signal() {
     return;
   }
 
-  // An empty cue is how silence clears the display. FFmpeg's SRT writer omits
+  // An empty cue is how a caller clears the display. FFmpeg's SRT writer omits
   // blank cue bodies, so this asserts the tag reaches the demuxer at all by
-  // counting what precedes and follows it.
-  let flv = produce_flv(&[(0, "visible"), (500, ""), (1000, "visible again")]);
-  let cues = ffprobe_cues(&flv);
-  assert!(
-    cues.iter().any(|(_, text)| text == "visible"),
-    "first cue missing: {cues:?}"
-  );
-  assert!(
-    cues.iter().any(|(_, text)| text == "visible again"),
-    "third cue missing: {cues:?}"
-  );
+  // checking what precedes and follows it.
+  for muxer in MUXERS {
+    if !muxer_available(muxer) {
+      continue;
+    }
+    let flv = produce_flv(muxer, &[(0, "visible"), (500, ""), (1000, "visible again")]);
+    let cues = ffprobe_cues(&flv);
+    assert!(
+      cues.iter().any(|(_, text)| text == "visible"),
+      "{muxer}: first cue missing: {cues:?}"
+    );
+    assert!(
+      cues.iter().any(|(_, text)| text == "visible again"),
+      "{muxer}: third cue missing: {cues:?}"
+    );
+  }
 }
 
 #[test]
@@ -271,12 +302,17 @@ fn av_only_input_gains_no_cues_of_our_own() {
   // With no cues the element must be transparent. Any *legible* cue here would
   // mean we invented one; the AMF control bytes from repeated `onMetaData` are
   // filtered by `ffprobe_cues` because they are the muxer's, not ours.
-  let with_element = produce_flv(&[]);
-  assert!(!with_element.is_empty());
+  for muxer in MUXERS {
+    if !muxer_available(muxer) {
+      continue;
+    }
+    let with_element = produce_flv(muxer, &[]);
+    assert!(!with_element.is_empty(), "{muxer}");
 
-  if ffprobe_available() {
-    let cues = ffprobe_cues(&with_element);
-    assert!(cues.is_empty(), "unexpected cues: {cues:?}");
+    if ffprobe_available() {
+      let cues = ffprobe_cues(&with_element);
+      assert!(cues.is_empty(), "{muxer}: unexpected cues: {cues:?}");
+    }
   }
 }
 
@@ -290,14 +326,19 @@ fn passthrough_is_byte_identical_without_cues() {
   // exactly one tag by design, so asserting transparency around it would only
   // restate the implementation; what matters is that the A/V bytes themselves
   // are never touched.
-  let injected = produce_flv_with(&[], false);
-  let direct = produce_flv_without_element();
-  assert_eq!(
-    injected.len(),
-    direct.len(),
-    "element altered the byte count of an uncaptioned stream"
-  );
-  assert_eq!(injected, direct, "element altered an uncaptioned stream");
+  for muxer in MUXERS {
+    if !muxer_available(muxer) {
+      continue;
+    }
+    let injected = produce_flv_with(muxer, &[], false);
+    let direct = produce_flv_without_element(muxer);
+    assert_eq!(
+      injected.len(),
+      direct.len(),
+      "{muxer}: element altered the byte count of an uncaptioned stream"
+    );
+    assert_eq!(injected, direct, "{muxer}: element altered an uncaptioned stream");
+  }
 }
 
 #[test]
@@ -310,7 +351,122 @@ fn priming_declares_the_subtitle_stream_before_any_cue() {
   // A stream whose captions start late must still be discoverable as carrying
   // subtitles: FFmpeg creates the text stream lazily on the first cue, and a
   // packager that has finished probing by then never sees one.
-  let primed = produce_flv_with(&[], true);
+  for muxer in MUXERS {
+    if !muxer_available(muxer) {
+      continue;
+    }
+    assert_primes(muxer);
+  }
+}
+
+/// Assert the invariant the element is built on, for one muxer.
+///
+/// `handle_flv_buffer` reads `GST_BUFFER_PTS` and forwards the buffer whole
+/// rather than parsing the byte stream, which is only sound if a buffer is
+/// exactly one FLV tag. That is a property of the muxer, not of this element,
+/// so it is asserted directly against each muxer rather than inferred from the
+/// round-trip passing.
+///
+/// Checked with audio and video interleaved and through a `queue`, because
+/// those are the conditions under which buffers would plausibly be merged.
+fn assert_one_tag_per_buffer(muxer: &str) {
+  init();
+
+  let pipeline = gst::Pipeline::new();
+  let video = gst::ElementFactory::make("videotestsrc")
+    .property("num-buffers", 40i32)
+    .property_from_str("pattern", "black")
+    .build()
+    .unwrap();
+  let encoder = gst::ElementFactory::make("x264enc")
+    .property_from_str("speed-preset", "ultrafast")
+    .property("key-int-max", 10u32)
+    .build()
+    .unwrap();
+  let parser = gst::ElementFactory::make("h264parse").build().unwrap();
+  let audio = gst::ElementFactory::make("audiotestsrc")
+    .property("num-buffers", 60i32)
+    .build()
+    .unwrap();
+  let audio_encoder = gst::ElementFactory::make("avenc_aac").build().unwrap();
+  let audio_parser = gst::ElementFactory::make("aacparse").build().unwrap();
+  let mux = gst::ElementFactory::make(muxer)
+    .property("streamable", true)
+    .build()
+    .unwrap();
+  let queue = gst::ElementFactory::make("queue").build().unwrap();
+  let sink = gst::ElementFactory::make("appsink")
+    .property("sync", false)
+    .build()
+    .unwrap();
+
+  pipeline
+    .add_many([
+      &video,
+      &encoder,
+      &parser,
+      &audio,
+      &audio_encoder,
+      &audio_parser,
+      &mux,
+      &queue,
+      &sink,
+    ])
+    .unwrap();
+  gst::Element::link_many([&video, &encoder, &parser, &mux]).unwrap();
+  gst::Element::link_many([&audio, &audio_encoder, &audio_parser, &mux]).unwrap();
+  gst::Element::link_many([&mux, &queue, &sink]).unwrap();
+
+  let appsink = sink.downcast::<gst_app::AppSink>().unwrap();
+  pipeline.set_state(gst::State::Playing).unwrap();
+
+  let mut timestamped = 0usize;
+  let mut headers = 0usize;
+  while let Some(sample) = appsink.try_pull_sample(gst::ClockTime::from_seconds(5)) {
+    let buffer = sample.buffer().unwrap();
+    let map = buffer.map_readable().unwrap();
+
+    if buffer.pts().is_none() {
+      // Stream headers: the FLV header, `onMetaData`, and codec data. These
+      // are generated rather than derived from media, are forwarded untouched,
+      // and are not required to be single tags.
+      headers += 1;
+      continue;
+    }
+
+    timestamped += 1;
+    let slice = map.as_slice();
+    let header = parse_tag_header(slice)
+      .unwrap_or_else(|| panic!("{muxer}: timestamped buffer is not a parseable FLV tag"));
+    assert_eq!(
+      header.total_len(),
+      slice.len(),
+      "{muxer}: buffer of {} bytes carries a {}-byte tag, so it is not exactly one tag",
+      slice.len(),
+      header.total_len()
+    );
+  }
+
+  pipeline.set_state(gst::State::Null).unwrap();
+  assert!(headers > 0, "{muxer}: no stream headers observed");
+  assert!(
+    timestamped > 20,
+    "{muxer}: only {timestamped} timestamped buffers observed"
+  );
+}
+
+#[test]
+fn every_muxer_buffer_is_exactly_one_tag() {
+  for muxer in MUXERS {
+    if !muxer_available(muxer) {
+      continue;
+    }
+    assert_one_tag_per_buffer(muxer);
+  }
+}
+
+fn assert_primes(muxer: &str) {
+  let primed = produce_flv_with(muxer, &[], true);
   let streams = String::from_utf8_lossy(
     &Command::new("ffprobe")
       .args([
@@ -332,6 +488,6 @@ fn priming_declares_the_subtitle_stream_before_any_cue() {
 
   assert!(
     streams.contains("text"),
-    "priming did not declare a subtitle stream: {streams:?}"
+    "{muxer}: priming did not declare a subtitle stream: {streams:?}"
   );
 }
