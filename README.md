@@ -122,6 +122,45 @@ further along.
 | `late-policy` | `clamp` | A cue the stream has passed: `clamp` to the current position, or `drop` |
 | `prime` | `true` | Declare the subtitle stream with one invisible cue at the start |
 
+## Integration contract
+
+Three always pads:
+
+```text
+sink   video/x-flv      the muxed stream, from flvmux or eflvmux
+text   text/x-raw, format=utf8
+src    video/x-flv
+```
+
+Every text buffer must carry a PTS; one without is dropped with a warning,
+since a cue with no position cannot be placed. Cue text must be valid UTF-8,
+and is truncated at 64 KB with a warning — the AMF0 short-string limit.
+
+Both sink pads are compared in **running time**, which is the only domain the
+two branches share. The element calibrates its cue origin from the first
+timestamped FLV buffer, because the muxer rebases tag timestamps against its
+own first sample: keying off the first buffer of any kind would leave the
+origin unset, since stream headers carry no PTS.
+
+The FLV thread is the only writer. The text pad's events do not reach the
+source pad — forwarding a text `caps` or `EOS` would renegotiate the output or
+end the stream while A/V is still flowing.
+
+On EOS, queued cues are written before the stream ends rather than discarded,
+clamped to the final stream position. On `FlushStop`, queued cues and the
+calibrated origin are dropped: they belong to a timeline that is no longer
+being sent.
+
+## Debugging
+
+```bash
+GST_DEBUG=flvsubinject:6 gst-launch-1.0 ...
+```
+
+Logs include origin calibration, each queued cue, priming, late-cue drops, and
+a teardown summary of cues written, dropped, and still queued. A buffer that is
+not exactly one FLV tag warns on the first occurrence and periodically after.
+
 ## What this element does not do
 
 Deliberately narrow. It does not wrap text, decide when a caption is complete,
@@ -169,6 +208,28 @@ export GST_PLUGIN_PATH="$PWD/target/release"
 gst-inspect-1.0 flvsubinject
 ```
 
+Requires Rust 1.85+ and GStreamer 1.20 development headers. `eflvmux` needs
+GStreamer 1.28 or newer; the tests skip it with a notice on older builds.
+
+## Try it
+
+Mux a test pattern, inject two cues, and read them back with FFmpeg:
+
+```bash
+gst-launch-1.0 -e \
+  videotestsrc num-buffers=90 ! x264enc speed-preset=ultrafast ! h264parse \
+  ! eflvmux streamable=true ! flvsubinject name=inject ! filesink location=out.flv \
+  appsrc name=cues format=time caps=text/x-raw,format=utf8 ! inject.text
+```
+
+In a real pipeline the text pad is fed by a caption source such as
+[gst-textrollup]. To confirm the result is readable by the ecosystem:
+
+```bash
+ffprobe -select_streams s -show_streams out.flv     # Subtitle: text
+ffmpeg -i out.flv -map 0:s:0 -f srt -               # the cues themselves
+```
+
 ## Tests
 
 ```bash
@@ -197,3 +258,26 @@ subtitle packet holding a lone AMF control byte.
 
 This predates this element and reproduces with a bare `flvmux ! filesink`. The
 tests filter exactly that shape rather than asserting it away.
+
+## Status and limitations
+
+In production use behind `eflvmux` for live transcription captions, with the
+wire format verified against FFmpeg 8 by round-trip rather than by reading the
+specification.
+
+Known limits:
+
+* **Flush and seek are covered synthetically only.** The harness tests drive
+  `FlushStop` directly; no test exercises a flush from a live RTMP source,
+  because the live path never seeks.
+* **Cue durations are advisory.** A `duration` property is written when asked
+  for, but FFmpeg ignores it and resolves a cue's end from its successor, so
+  the presentation model is cue replacement whatever the value says.
+* **One text pad.** Multiple languages would need multiple message names or a
+  language property, neither of which the FLV convention specifies.
+
+## License
+
+MPL-2.0.
+
+[gst-textrollup]: https://github.com/darfink/gst-textrollup
