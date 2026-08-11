@@ -39,7 +39,7 @@ use gst::prelude::*;
 use gst::subclass::prelude::*;
 
 use crate::amf::{script_data_body, MessageName};
-use crate::flv::{parse_tag_header, script_data_tag, MAXIMUM_TIMESTAMP_MS};
+use crate::flv::{script_data_tag, MAXIMUM_TIMESTAMP_MS};
 
 static CAT: std::sync::LazyLock<gst::DebugCategory> = std::sync::LazyLock::new(|| {
   gst::DebugCategory::new(
@@ -133,14 +133,6 @@ struct State {
   /// compared, and running time is the only one both branches share.
   flv_segment: Option<gst::FormattedSegment<gst::ClockTime>>,
   text_segment: Option<gst::FormattedSegment<gst::ClockTime>>,
-  /// Bytes of a partially received tag, carried between chained buffers.
-  ///
-  /// `flvmux` emits whole tags, but nothing in the pad contract guarantees a
-  /// buffer boundary falls on one, and a downstream `queue` may recombine
-  /// them. Splicing mid-tag would corrupt the stream, so partial tags are held.
-  partial: Vec<u8>,
-  /// Whether the 9-byte FLV header has been consumed.
-  header_seen: bool,
   /// Millisecond timestamp of the most recent tag forwarded.
   stream_position_ms: u32,
   /// Running time of the first A/V tag, used to rebase cue timestamps.
@@ -176,6 +168,8 @@ pub struct FlvSubInject {
   src: gst::Pad,
   settings: Mutex<Settings>,
   state: Mutex<State>,
+  /// Whether the one-tag-per-buffer warning has already been emitted.
+  invariant_warned: std::sync::atomic::AtomicBool,
 }
 
 impl FlvSubInject {
@@ -309,108 +303,131 @@ impl FlvSubInject {
   }
 
   /// Forward FLV bytes, splicing queued cues at tag boundaries.
+  /// Forward one muxed FLV buffer, emitting any cues it has moved past.
+  ///
+  /// `flvmux`/`eflvmux` emit exactly one whole FLV tag per buffer, stamped
+  /// with the running time of the media it carries. Verified against 1.28.5
+  /// for video-only and interleaved audio/video, including through a `queue`:
+  /// buffer sizes match tag sizes exactly, and the muxer's own
+  /// `gst_aggregator_finish_buffer` path has no way to emit a partial tag.
+  ///
+  /// So this element does not parse the byte stream. It reads the PTS the
+  /// muxer already computed and forwards the buffer untouched. An earlier
+  /// version accumulated bytes and parsed 11-byte tag headers to recover the
+  /// same timestamps; that was defensive against something that does not
+  /// happen, and the buffer boundaries it reconstructed were the ones it had
+  /// been given.
+  ///
+  /// The stream-header buffers — FLV header, `onMetaData`, codec data — carry
+  /// no PTS. They are forwarded as-is and establish nothing: the timeline is
+  /// calibrated from the first *timestamped* buffer, since keying off the
+  /// first buffer of any kind leaves the origin unset forever and silently
+  /// strands every queued cue.
   fn handle_flv_buffer(&self, buffer: gst::Buffer) -> Result<gst::FlowSuccess, gst::FlowError> {
-    let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+    self.check_one_tag_per_buffer(&buffer);
 
-    let mut state = self.state.lock().unwrap();
-    state.partial.extend_from_slice(map.as_slice());
-    drop(map);
+    let Some(pts) = buffer.pts() else {
+      // A stream header. Nothing to place cues against yet.
+      return self.src.push(buffer);
+    };
 
-    // Calibrate the cue timeline against the muxer's, once.
-    //
-    // The FLV header and the `onMetaData` tag that follow it are generated
-    // rather than derived from media, and `flvmux` pushes them with no PTS at
-    // all. Only buffers carrying media tags are timestamped, so calibration
-    // waits for the first of those instead of the first buffer: keying off the
-    // first buffer leaves the origin unset forever and silently strands every
-    // cue in the queue.
-    if state.origin.is_none()
-      && let Some(pts) = buffer.pts()
-    {
-      let running_time = State::running_time(state.flv_segment.as_ref(), pts);
-      gst::debug!(CAT, imp = self, "calibrated cue origin at {running_time}");
-      state.origin = Some(running_time);
-    }
-
-    let mut output: Vec<gst::Buffer> = Vec::new();
-    let mut consumed = 0usize;
-    let (settings_prime, message_name) = {
+    let (prime, message_name) = {
       let settings = self.settings.lock().unwrap();
       (settings.prime, MessageName::from(settings.message_name))
     };
 
-    // The 9-byte FLV header plus its zero PreviousTagSize precede all tags.
-    if !state.header_seen {
-      const FLV_HEADER_LEN: usize = 9 + 4;
-      if state.partial.len() < FLV_HEADER_LEN {
-        return Ok(gst::FlowSuccess::Ok);
-      }
-      output.push(gst::Buffer::from_mut_slice(
-        state.partial[..FLV_HEADER_LEN].to_vec(),
-      ));
-      consumed = FLV_HEADER_LEN;
-      state.header_seen = true;
+    let mut state = self.state.lock().unwrap();
+    let running_time = State::running_time(state.flv_segment.as_ref(), pts);
+    let origin = *state.origin.get_or_insert_with(|| {
+      gst::debug!(CAT, imp = self, "calibrated cue origin at {running_time}");
+      running_time
+    });
+
+    // Tag timestamps are rebased against the muxer's first timestamp, so cues
+    // have to be expressed in the same rebased domain to line up with them.
+    state.stream_position_ms = u32::try_from(
+      running_time
+        .saturating_sub(origin)
+        .mseconds()
+        .min(MAXIMUM_TIMESTAMP_MS),
+    )
+    .unwrap_or(u32::MAX);
+
+    let mut output: Vec<gst::Buffer> = Vec::new();
+
+    // Declare the subtitle timeline at the very start of the stream.
+    //
+    // FLV has no track table: a script-data subtitle stream exists only once
+    // its first cue has been seen. A demuxer that finishes probing before then
+    // concludes the stream has no captions and never revisits it — FFmpeg's
+    // `flv_data_packet` creates the `AV_CODEC_ID_TEXT` stream lazily, and a
+    // packager built on it reports zero subtitle tracks.
+    //
+    // Speech-derived captions always lose that race: the first cue cannot
+    // appear until someone has spoken and the recognizer has committed a word,
+    // which is seconds after the probe window closes.
+    //
+    // One invisible cue at the head of the stream fixes it, and is the exact
+    // analogue of what the carriage this replaces does: CEA-708 declares its
+    // service by sending null padding from the first frame, long before any
+    // caption text exists.
+    if prime && !state.primed {
+      let body = script_data_body(message_name, PRIMING_TEXT, None);
+      output.push(gst::Buffer::from_mut_slice(script_data_tag(
+        state.stream_position_ms,
+        &body,
+      )));
+      state.primed = true;
+      gst::debug!(
+        CAT,
+        imp = self,
+        "primed subtitle stream at {}ms",
+        state.stream_position_ms
+      );
     }
 
-    loop {
-      let Some(header) = parse_tag_header(&state.partial[consumed..]) else {
-        break;
-      };
-      let total = header.total_len();
-      if state.partial.len() - consumed < total {
-        break;
-      }
-
-      // Cues belonging before this tag go out ahead of it, so the output stays
-      // ordered by timestamp.
-      state.stream_position_ms = header.timestamp_ms;
-
-      // Declare the subtitle timeline at the very start of the stream.
-      //
-      // FLV has no track table: a script-data subtitle stream exists only once
-      // its first cue has been seen. A demuxer that finishes probing before
-      // then concludes the stream has no captions and never revisits it —
-      // FFmpeg's `flv_data_packet` creates the `AV_CODEC_ID_TEXT` stream
-      // lazily, and a packager built on it reports zero subtitle tracks.
-      //
-      // Speech-derived captions always lose that race: the first cue cannot
-      // appear until someone has spoken and the recognizer has committed a
-      // word, which is seconds after the probe window closes.
-      //
-      // One invisible cue at the head of the stream fixes it, and is the exact
-      // analogue of what the carriage this replaces does: CEA-708 declares its
-      // service by sending null padding from the first frame, long before any
-      // caption text exists.
-      if settings_prime && !state.primed {
-        let body = script_data_body(message_name, PRIMING_TEXT, None);
-        output.push(gst::Buffer::from_mut_slice(script_data_tag(
-          header.timestamp_ms,
-          &body,
-        )));
-        state.primed = true;
-        gst::debug!(
-          CAT,
-          imp = self,
-          "primed subtitle stream at {}ms",
-          header.timestamp_ms
-        );
-      }
-
-      let ready = self.drain_ready(&mut state);
-      output.extend(ready);
-
-      output.push(gst::Buffer::from_mut_slice(
-        state.partial[consumed..consumed + total].to_vec(),
-      ));
-      consumed += total;
-    }
-
-    if consumed > 0 {
-      state.partial.drain(..consumed);
-    }
+    // Cues belonging before this tag go out ahead of it, so the output stays
+    // ordered by timestamp.
+    output.extend(self.drain_ready(&mut state));
     drop(state);
 
+    output.push(buffer);
     self.push_tags(output)
+  }
+
+  /// Warn once if a buffer is not exactly one whole FLV tag.
+  ///
+  /// The element depends on this invariant, so it is asserted rather than
+  /// assumed. It is checked instead of handled: a splitter or repackager that
+  /// broke it would need a design change here, not a silent fallback, and a
+  /// silent fallback is what would make the resulting mistimed captions hard
+  /// to trace back to their cause.
+  fn check_one_tag_per_buffer(&self, buffer: &gst::Buffer) {
+    if self.invariant_warned.load(std::sync::atomic::Ordering::Relaxed) {
+      return;
+    }
+    let Ok(map) = buffer.map_readable() else {
+      return;
+    };
+    // Stream headers are concatenated small blocks rather than single tags,
+    // and carry no PTS; they are forwarded untouched and are not covered.
+    if buffer.pts().is_none() {
+      return;
+    }
+    let matches_one_tag = crate::flv::parse_tag_header(map.as_slice())
+      .is_some_and(|header| header.total_len() == map.size());
+    if !matches_one_tag {
+      self
+        .invariant_warned
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+      gst::warning!(
+        CAT,
+        imp = self,
+        "buffer of {} bytes is not exactly one FLV tag; cue placement assumes \
+         one tag per buffer and may be misaligned",
+        map.size()
+      );
+    }
   }
 }
 
@@ -492,6 +509,7 @@ impl ObjectSubclass for FlvSubInject {
       src,
       settings: Mutex::new(Settings::default()),
       state: Mutex::new(State::default()),
+      invariant_warned: std::sync::atomic::AtomicBool::new(false),
     }
   }
 }

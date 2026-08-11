@@ -23,11 +23,40 @@ Their output, however, is a flat sequence of self-delimiting tags, each stamped
 with a rebased millisecond timestamp. A correctly framed script-data tag can
 simply be spliced between two existing tags, which is all this element does.
 
+More precisely, the muxers emit **exactly one whole FLV tag per buffer**, with
+the running time of the media it carries in `GST_BUFFER_PTS`. So this element
+does not parse the byte stream at all: it reads the timestamp the muxer already
+computed and forwards the buffer untouched. The invariant is checked at
+runtime, and a buffer that is not one whole tag produces a warning rather than
+a silent misplacement.
+
 Sitting after the muxer has a second consequence that matters more than the
 convenience: **the text path never enters an aggregator.** `cccombiner` and
 `matroskamux` block until every sink pad is non-empty, which is what forces
 keepalive machinery onto sparse caption branches. This element waits for
 nothing, and silence costs zero bytes.
+
+## Why not a `GstAggregator`
+
+An aggregator would supply pad-alignment for free, which is how `cccombiner`
+gets its guarantee. It does not fit here, and the reason is worth stating
+because it looks like the obvious choice.
+
+`cccombiner` never sets `force-live`. It does not need to: `tttocea708` feeds
+it one caption buffer per video frame, padding included, so its caption pad is
+never empty. A `GstAggregator` that *does* see an empty pad waits for it
+indefinitely unless it is live — the timeout branch in
+`gst_aggregator_wait_and_check()` is reached only when latency is valid.
+
+A script-data caption timeline is sparse by design; that sparseness is the
+bitrate saving. Satisfying an aggregator would mean padding the text pad back
+to frame rate, adding keepalive GAP events, or running live and accepting
+clock-paced output — and the last one caps throughput at 1×, which a burst
+republish path cannot afford.
+
+So alignment here is built rather than inherited: the FLV thread is the only
+writer, cues are placed against the tag timestamps they precede, and both
+properties are covered by `tests/ordering.rs`.
 
 ## Wire format
 
