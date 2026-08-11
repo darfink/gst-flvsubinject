@@ -181,9 +181,29 @@ pub struct FlvSubInject {
 impl FlvSubInject {
   /// Accept a cue from the text pad.
   ///
-  /// Cues are queued rather than written immediately: the FLV stream may not
-  /// have reached this timestamp yet, and writing ahead of it would produce
-  /// out-of-order tags.
+  /// This runs on the *text* streaming thread, which is not the thread carrying
+  /// FLV bytes. It therefore only ever queues: it must never touch the tag
+  /// stream or push anything downstream.
+  ///
+  /// The reason is the difference between this element and `cccombiner`.
+  /// `cccombiner` is a `GstAggregator`, so alignment is structural: a single
+  /// `aggregate()` call pulls from both pads on one thread, and nothing it
+  /// emits can interleave or misorder. This element is a plain `GstElement`
+  /// with two independently-scheduled chain functions, so that guarantee has
+  /// to be built rather than inherited.
+  ///
+  /// It is built by making the FLV thread the only writer. If this thread also
+  /// pushed, two failures would follow, and the first is far worse than the
+  /// second:
+  ///
+  /// 1. **Framing.** The FLV thread emits whole tags, but it holds a partially
+  ///    consumed buffer between them. A push from here can land between two
+  ///    `src.push()` calls of a single chain invocation, splicing a script tag
+  ///    into the middle of another tag's body. That does not lose one caption;
+  ///    it desynchronizes the byte stream and every byte after it is garbage.
+  /// 2. **Ordering.** Even when framing survives, a cue written without
+  ///    reference to the current tag position can land after a later-timestamped
+  ///    A/V tag, so a consumer that trusts tag order mis-times it.
   fn handle_text_buffer(&self, buffer: &gst::Buffer) -> Result<gst::FlowSuccess, gst::FlowError> {
     let Some(pts) = buffer.pts() else {
       gst::warning!(CAT, imp = self, "text buffer without PTS, dropping");
@@ -211,20 +231,21 @@ impl FlvSubInject {
     state
       .pending
       .sort_by_key(|cue: &PendingCue| cue.running_time);
-
-    // Cues that the stream has already passed can be written now; the rest
-    // wait for the FLV side to advance. Without this, a cue arriving during a
-    // lull in A/V would sit in the queue until the next tag happened past.
-    let tags = self.drain_ready(&mut state);
-    drop(state);
-
-    if tags.is_empty() {
-      return Ok(gst::FlowSuccess::Ok);
-    }
-    self.push_tags(tags)
+    Ok(gst::FlowSuccess::Ok)
   }
 
   /// Serialize every queued cue the stream position has reached.
+  ///
+  /// Only ever called from the FLV streaming thread, which is what keeps the
+  /// element single-writer. A cue therefore leaves the queue when the next tag
+  /// arrives rather than the instant it is produced.
+  ///
+  /// That is a real latency bound, and it is the muxer's cadence rather than
+  /// anything this element adds: video at 30fps means a tag roughly every
+  /// 33ms, and audio adds more. A caption is delayed by at most one tag
+  /// interval, which is far below the delay the caption pipeline already
+  /// carries to align text with A/V. Draining eagerly from the text thread
+  /// would trade that bounded delay for a corrupt byte stream.
   fn drain_ready(&self, state: &mut State) -> Vec<gst::Buffer> {
     let Some(origin) = state.origin else {
       return Vec::new();
