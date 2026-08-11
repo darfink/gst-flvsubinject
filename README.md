@@ -128,35 +128,32 @@ In particular, a cue whose text is empty is **not** filtered out: a caller that
 wants to signal "clear the display" must be able to, and suppressing it would
 strand the previous caption on screen.
 
-## Clearing the display is not yet an end-to-end contract
+## Clearing the display
 
 FLV script data has no explicit erase. CEA-708 has one — `tttocea708` responds
 to a GAP event by generating an empty window, and enforces a `roll-up-timeout`
 itself — so one element owns both the decision and its enforcement.
 
-Here the decision and the enforcement are split, and that is a real gap rather
-than a stylistic difference:
+The same model is available here, expressed in the only vocabulary this
+transport has: **an empty cue means "stop displaying"**.
 
-* `textrollup` decides when to clear (`clear-timeout`, 3s after the last word)
-  and expresses it by emitting a **GAP event**, never an empty cue.
-* A cue therefore goes out with no end time, and the consumer reconstructs the
-  end as "successor, or a cap of its own choosing".
+* `textrollup` decides when to clear (`clear-timeout`) and, with
+  `emit-clear-cue=true`, emits a zero-duration empty cue at that position.
+* This element forwards it like any other cue.
+* A consumer reads an empty cue as an instruction: it ends whatever is open and
+  publishes nothing in its place.
 
-When the publisher's `clear-timeout` and the consumer's cap agree, the display
-clears at the intended moment by coincidence. When they differ, it does not:
-with `clear-timeout=10s` against a 3s consumer cap, captions were measured
-ending at exactly `start + 3s`, ignoring the publisher's policy entirely.
+That keeps the decision and its enforcement with the element that made it. It
+matters because a cue with no end otherwise runs until its successor or until a
+cap the *consumer* chose: measured with `clear-timeout=10s` against a 3s
+consumer cap, captions ended at exactly `start + 3s`, ignoring the publisher
+entirely.
 
-The clean fix crosses the repository boundary: `textrollup` emits an
-**empty-text cue** at its clear position, this element forwards it (it already
-does), and the consumer treats an empty `Codec::Text` cue as "close the open
-cue and publish nothing". That restores the 708 model — one owner for the
-decision, enforced where it was made — and makes both timeout constants
-irrelevant.
-
-Until then, note that an empty cue forwarded from here may be *rejected* by a
-WebVTT-republishing consumer, since a blank body terminates a WebVTT cue. That
-is why priming uses U+200B rather than `""`.
+A consumer that does not implement this will treat an empty cue as an empty
+caption, or reject it outright — a blank body terminates a WebVTT cue. Leave
+`emit-clear-cue` off for such a consumer, and note that this is why priming
+uses U+200B rather than `""`: the priming cue must render as nothing *without*
+being read as a clear.
 
 ## Build
 

@@ -32,18 +32,17 @@
 //! caller that wants to signal "clear the display" must be able to, and
 //! suppressing it would silently strand the previous caption on screen.
 //!
-//! Be aware that this is not yet an end-to-end contract. FLV script data has
-//! no explicit erase, so "clear" can only be expressed as a cue that renders
-//! as nothing — and a consumer republishing these cues as WebVTT is obliged to
-//! reject empty cue text, because a blank body terminates a WebVTT cue. So an
-//! empty cue forwarded from here can fail such a consumer rather than clear
-//! its display. That is why priming uses U+200B rather than `""`.
+//! FLV script data has no explicit erase, so "clear the display" can only be
+//! expressed as a cue that renders as nothing. `textrollup` emits one at its
+//! `clear-timeout` when `emit-clear-cue` is set, and a consumer that reads an
+//! empty cue as an instruction ends the open caption there and publishes
+//! nothing in its place. That keeps the clear at the position the roll-up
+//! element chose rather than at a timeout the consumer picked.
 //!
-//! Today nothing exercises this: `textrollup` clears its window by emitting a
-//! GAP event, not an empty buffer, so empty cues do not occur in the pipeline
-//! this element was built for. Wiring a real clear signal end to end needs the
-//! consumer to treat an empty text cue as "close the open cue and publish
-//! nothing" — see README.
+//! A consumer without that behaviour will treat an empty cue as an empty
+//! caption, or reject it — a blank body terminates a WebVTT cue. This is also
+//! why priming uses U+200B rather than `""`: the priming cue must render as
+//! nothing without being read as a clear.
 
 use std::sync::Mutex;
 
