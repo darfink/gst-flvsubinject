@@ -95,6 +95,7 @@ fn run_concurrent(muxer: &str, cue_count: u64) -> Vec<u8> {
   let text_queue = gst::ElementFactory::make("queue").build().unwrap();
   let inject = gst::ElementFactory::make("flvsubinject")
     .property("prime", false)
+    .property_from_str("input-mode", "replacement")
     .build()
     .unwrap();
   let sink = gst::ElementFactory::make("appsink")
@@ -132,10 +133,11 @@ fn run_concurrent(muxer: &str, cue_count: u64) -> Vec<u8> {
     for index in 0..cue_count {
       let text = format!("cue {index}");
       let mut buffer = gst::Buffer::from_slice(text.into_bytes());
-      buffer
-        .get_mut()
-        .unwrap()
-        .set_pts(gst::ClockTime::from_mseconds(index * 30));
+      {
+        let buffer = buffer.get_mut().unwrap();
+        buffer.set_pts(gst::ClockTime::from_mseconds(index * 30));
+        buffer.set_duration(gst::ClockTime::from_mseconds(20));
+      }
       if appsrc.push_buffer(buffer).is_err() {
         break;
       }

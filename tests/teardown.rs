@@ -29,9 +29,19 @@ struct Harness {
 
 impl Harness {
   fn new() -> Self {
+    Self::new_with_mode(Some("replacement"))
+  }
+
+  fn new_with_mode(input_mode: Option<&str>) -> Self {
     init();
     let mut flv = gst_check::Harness::with_padnames("flvsubinject", Some("sink"), Some("src"));
-    flv.element().unwrap().set_property("prime", false);
+    {
+      let element = flv.element().unwrap();
+      element.set_property("prime", false);
+      if let Some(input_mode) = input_mode {
+        element.set_property_from_str("input-mode", input_mode);
+      }
+    }
 
     // A second harness on the text pad of the *same* element, which is how
     // gst_check models an element with more than one sink pad.
@@ -66,19 +76,25 @@ impl Harness {
     tag.extend_from_slice(&total.to_be_bytes());
 
     let mut buffer = gst::Buffer::from_mut_slice(tag);
-    buffer
-      .get_mut()
-      .unwrap()
-      .set_pts(gst::ClockTime::from_mseconds(millis));
+    {
+      let buffer = buffer.get_mut().unwrap();
+      buffer.set_pts(gst::ClockTime::from_mseconds(millis));
+      buffer.set_duration(gst::ClockTime::from_mseconds(100));
+    }
     self.flv.push(buffer).expect("push flv tag");
   }
 
   fn push_cue(&mut self, millis: u64, text: &str) {
+    self.push_cue_with_duration(millis, 100, text);
+  }
+
+  fn push_cue_with_duration(&mut self, millis: u64, duration_ms: u64, text: &str) {
     let mut buffer = gst::Buffer::from_slice(text.as_bytes().to_vec());
-    buffer
-      .get_mut()
-      .unwrap()
-      .set_pts(gst::ClockTime::from_mseconds(millis));
+    {
+      let buffer = buffer.get_mut().unwrap();
+      buffer.set_pts(gst::ClockTime::from_mseconds(millis));
+      buffer.set_duration(gst::ClockTime::from_mseconds(duration_ms));
+    }
     self.text.push(buffer).expect("push cue");
   }
 
@@ -88,6 +104,13 @@ impl Harness {
   /// assertion meaningful: the question is *which* cue survived, and a count
   /// cannot distinguish a stale cue from its replacement.
   fn cue_texts(&mut self) -> Vec<String> {
+    self.cue_states()
+      .into_iter()
+      .map(|(_, text)| text)
+      .collect()
+  }
+
+  fn cue_states(&mut self) -> Vec<(u32, String)> {
     let mut bytes = Vec::new();
     while let Some(buffer) = self.flv.try_pull() {
       let map = buffer.map_readable().unwrap();
@@ -103,7 +126,7 @@ impl Harness {
       }
       if header.tag_type == TAG_TYPE_SCRIPT_DATA {
         let body = &bytes[cursor + 11..cursor + 11 + header.body_size];
-        texts.push(extract_text(body));
+        texts.push((header.timestamp_ms, extract_text(body)));
       }
       cursor += header.total_len();
     }
@@ -113,6 +136,118 @@ impl Harness {
   fn script_tag_count(&mut self) -> usize {
     self.cue_texts().len()
   }
+}
+
+#[test]
+fn timed_mode_shows_then_clears_at_duration_end() {
+  let mut harness = Harness::new_with_mode(None);
+  harness.push_flv_tag(0);
+  harness.push_cue_with_duration(100, 200, "timed");
+  harness.push_flv_tag(100);
+  harness.push_flv_tag(300);
+  assert_eq!(
+    harness.cue_states(),
+    vec![(100, "timed".into()), (300, String::new())]
+  );
+}
+
+#[test]
+fn adjacent_timed_replacement_has_no_intermediate_clear() {
+  let mut harness = Harness::new_with_mode(Some("timed"));
+  harness.push_flv_tag(0);
+  harness.push_cue_with_duration(100, 100, "first");
+  harness.push_cue_with_duration(200, 100, "second");
+  harness.push_flv_tag(100);
+  harness.push_flv_tag(200);
+  harness.push_flv_tag(300);
+  assert_eq!(
+    harness.cue_states(),
+    vec![
+      (100, "first".into()),
+      (200, "second".into()),
+      (300, String::new())
+    ]
+  );
+}
+
+#[test]
+fn overlapping_old_clear_cannot_erase_newer_cue() {
+  let mut harness = Harness::new_with_mode(Some("timed"));
+  harness.push_flv_tag(0);
+  harness.push_cue_with_duration(100, 200, "first");
+  harness.push_cue_with_duration(200, 200, "second");
+  for timestamp in [100, 200, 300, 400] {
+    harness.push_flv_tag(timestamp);
+  }
+  assert_eq!(
+    harness.cue_states(),
+    vec![
+      (100, "first".into()),
+      (200, "second".into()),
+      (400, String::new())
+    ]
+  );
+}
+
+#[test]
+fn identical_contiguous_timed_text_extends_without_duplicate() {
+  let mut harness = Harness::new_with_mode(Some("timed"));
+  harness.push_flv_tag(0);
+  harness.push_cue_with_duration(100, 100, "same");
+  harness.push_cue_with_duration(200, 100, "same");
+  for timestamp in [100, 200, 300] {
+    harness.push_flv_tag(timestamp);
+  }
+  assert_eq!(
+    harness.cue_states(),
+    vec![(100, "same".into()), (300, String::new())]
+  );
+}
+
+#[test]
+fn replacement_mode_ignores_duration_until_explicit_clear() {
+  let mut harness = Harness::new();
+  harness.push_flv_tag(0);
+  harness.push_cue_with_duration(100, 10, "persistent");
+  harness.push_flv_tag(100);
+  harness.push_flv_tag(1000);
+  harness.push_cue_with_duration(1200, 0, "");
+  harness.push_flv_tag(1200);
+  assert_eq!(
+    harness.cue_states(),
+    vec![(100, "persistent".into()), (1200, String::new())]
+  );
+}
+
+#[test]
+fn same_timestamp_replacements_serialize_only_final_state() {
+  let mut harness = Harness::new();
+  harness.push_flv_tag(0);
+  harness.push_cue(100, "first");
+  harness.push_cue(100, "final");
+  harness.push_flv_tag(100);
+  assert_eq!(harness.cue_states(), vec![(100, "final".into())]);
+}
+
+#[test]
+fn text_input_requires_pts_and_duration() {
+  let mut harness = Harness::new();
+  let mut missing_duration = gst::Buffer::from_slice(b"text".to_vec());
+  missing_duration
+    .get_mut()
+    .unwrap()
+    .set_pts(gst::ClockTime::from_mseconds(100));
+  assert_eq!(
+    harness.text.push(missing_duration),
+    Err(gst::FlowError::Error)
+  );
+
+  let mut missing_pts = gst::Buffer::from_slice(b"text".to_vec());
+  missing_pts
+    .get_mut()
+    .unwrap()
+    .set_duration(gst::ClockTime::from_mseconds(100));
+  assert_eq!(harness.text.push(missing_pts), Err(gst::FlowError::Error));
 }
 
 /// Pull the `text` property out of a serialized script-data body.
@@ -148,7 +283,7 @@ fn extract_text(body: &[u8]) -> String {
 }
 
 #[test]
-fn cues_queued_past_the_last_tag_are_written_at_eos() {
+fn transitions_past_final_media_are_discarded_at_eos() {
   let mut harness = Harness::new();
 
   harness.push_flv_tag(0);
@@ -165,8 +300,8 @@ fn cues_queued_past_the_last_tag_are_written_at_eos() {
 
   assert_eq!(
     harness.script_tag_count(),
-    1,
-    "the queued cue must be written before the stream ends, not dropped"
+    0,
+    "future transitions must not be clamped onto final media"
   );
 }
 

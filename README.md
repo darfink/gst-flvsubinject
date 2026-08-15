@@ -84,16 +84,22 @@ finds, so exactly one is written, first.
 correctly. Both reach the same branch and produce an `AV_CODEC_ID_TEXT`
 subtitle stream.
 
-## Cues have no duration
+## Input modes and FLV replacement semantics
 
-FFmpeg sets `pkt->dts = pkt->pts = dts` for these packets and never sets a
-duration. The presentation model is therefore strictly **cue replacement**: a
-cue displays until the next one arrives.
+FFmpeg sets `pkt->dts = pkt->pts = dts` and no packet duration. The FLV wire
+model is therefore strictly **state replacement**: text displays until another
+script-data state arrives.
 
-This is what `textrollup` already emits — each cue carries the entire window
-and ends where the next begins — so the two compose without translation. It
-also means silence must be expressed as a cue, not as an absence: whatever is
-on screen stays there until something replaces it.
+`input-mode=timed` (the default) adapts ordinary timed-text sources such as
+`whispertranscriber ! textwrap`: a non-empty buffer shows at PTS and schedules
+a generation-bound clear at `PTS + duration`. An overlapping newer cue cannot
+be erased by the older cue's clear. Adjacent transitions at one timestamp are
+coalesced, so replacement never exposes a transient blank.
+
+`input-mode=replacement` accepts persistent display states such as
+`textrollup`: non-empty text replaces the state at PTS, duration is validated
+but does not clear it, and empty text explicitly clears it. Identical states
+are suppressed in both modes.
 
 ## Priming
 
@@ -120,6 +126,7 @@ further along.
 | --- | ---: | --- |
 | `message-name` | `oncaption` | AMF0 message name: `oncaption` or `ontextdata` |
 | `late-policy` | `clamp` | A cue the stream has passed: `clamp` to the current position, or `drop` |
+| `input-mode` | `timed` | Interpret input as `timed` intervals or persistent `replacement` states |
 | `prime` | `true` | Declare the subtitle stream with one invisible cue at the start |
 
 ## Integration contract
@@ -132,8 +139,8 @@ text   text/x-raw, format=utf8
 src    video/x-flv
 ```
 
-Every text buffer must carry a PTS; one without is dropped with a warning,
-since a cue with no position cannot be placed. Cue text must be valid UTF-8,
+Every text buffer must carry PTS and duration; malformed input fails the text
+flow rather than being silently reinterpreted. Cue text must be valid UTF-8,
 and is truncated at 64 KB with a warning — the AMF0 short-string limit.
 
 Both sink pads are compared in **running time**, which is the only domain the
@@ -146,10 +153,10 @@ The FLV thread is the only writer. The text pad's events do not reach the
 source pad — forwarding a text `caps` or `EOS` would renegotiate the output or
 end the stream while A/V is still flowing.
 
-On EOS, queued cues are written before the stream ends rather than discarded,
-clamped to the final stream position. On `FlushStop`, queued cues and the
-calibrated origin are dropped: they belong to a timeline that is no longer
-being sent.
+On EOS, transitions at or before final media position are applied; future
+transitions are discarded rather than clamped onto media that never existed.
+On `FlushStop`, queued transitions and calibrated origin are dropped because
+they belong to a timeline that is no longer being sent.
 
 ## Debugging
 
@@ -157,8 +164,9 @@ being sent.
 GST_DEBUG=flvsubinject:6 gst-launch-1.0 ...
 ```
 
-Logs include origin calibration, each queued cue, priming, late-cue drops, and
-a teardown summary of cues written, dropped, and still queued. A buffer that is
+Logs include origin calibration, each queued transition, priming, and a
+teardown summary of shows, clears, identical suppression, late clamp/drop, and
+future discards. A buffer that is
 not exactly one FLV tag warns on the first occurrence and periodically after.
 
 ## What this element does not do
@@ -182,23 +190,22 @@ itself — so one element owns both the decision and its enforcement.
 The same model is available here, expressed in the only vocabulary this
 transport has: **an empty cue means "stop displaying"**.
 
-* `textrollup` decides when to clear (`clear-timeout`) and, with
-  `emit-clear-cue=true`, emits a zero-duration empty cue at that position.
+* `textrollup` decides when to clear (`clear-after`) and emits a zero-duration
+  empty state at that media position.
 * This element forwards it like any other cue.
 * A consumer reads an empty cue as an instruction: it ends whatever is open and
   publishes nothing in its place.
 
 That keeps the decision and its enforcement with the element that made it. It
 matters because a cue with no end otherwise runs until its successor or until a
-cap the *consumer* chose: measured with `clear-timeout=10s` against a 3s
+cap the *consumer* chose: measured with a publisher clear at 10s against a 3s
 consumer cap, captions ended at exactly `start + 3s`, ignoring the publisher
 entirely.
 
 A consumer that does not implement this will treat an empty cue as an empty
-caption, or reject it outright — a blank body terminates a WebVTT cue. Leave
-`emit-clear-cue` off for such a consumer, and note that this is why priming
-uses U+200B rather than `""`: the priming cue must render as nothing *without*
-being read as a clear.
+caption, or reject it outright — a blank body terminates a WebVTT cue. This is
+why priming uses U+200B rather than `""`: the priming cue must render as
+nothing *without* being read as a clear.
 
 ## Build
 

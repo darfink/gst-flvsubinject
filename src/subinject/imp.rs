@@ -20,29 +20,20 @@
 //!
 //! # What this element is *not* responsible for
 //!
-//! Deliberately narrow. It does not wrap text, does not decide when a caption
-//! is complete, does not clear the display on silence, and does not know that
-//! speech recognition exists. Those are windowing decisions that belong to the
-//! element producing the cues (`textrollup`), for the same reason that
-//! `tttocea708` owns roll-up state and `h264ccinserter` owns only carriage.
-//! This element owns exactly one thing: turning a timestamped string into a
-//! correctly framed FLV tag at the right point in a byte stream.
+//! Deliberately narrow. It does not wrap text, choose caption layout, clear on
+//! silence, or know that speech recognition exists. It translates either
+//! timed text intervals or explicit replacement states into FLV transitions.
 //!
 //! In particular, a cue whose text is empty is *not* filtered out here: a
 //! caller that wants to signal "clear the display" must be able to, and
 //! suppressing it would silently strand the previous caption on screen.
 //!
-//! FLV script data has no explicit erase, so "clear the display" can only be
-//! expressed as a cue that renders as nothing. `textrollup` emits one at its
-//! `clear-timeout` when `emit-clear-cue` is set, and a consumer that reads an
-//! empty cue as an instruction ends the open caption there and publishes
-//! nothing in its place. That keeps the clear at the position the roll-up
-//! element chose rather than at a timeout the consumer picked.
+//! FLV script data has no explicit erase, so "clear the display" is serialized
+//! as an empty text state. `textrollup` emits one at `clear-after`; ordinary
+//! timed cues get one scheduled from their duration in `input-mode=timed`.
 //!
-//! A consumer without that behaviour will treat an empty cue as an empty
-//! caption, or reject it — a blank body terminates a WebVTT cue. This is also
-//! why priming uses U+200B rather than `""`: the priming cue must render as
-//! nothing without being read as a clear.
+//! Priming uses U+200B rather than `""`: the priming state must render as
+//! nothing without being read as a clear transition.
 
 use std::sync::Mutex;
 
@@ -81,6 +72,19 @@ pub enum LatePolicy {
   Drop,
 }
 
+/// How input buffer timing maps to FLV display-state transitions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, glib::Enum)]
+#[enum_type(name = "GstFlvSubInjectInputMode")]
+pub enum InputMode {
+  /// A non-empty buffer shows at PTS and clears at PTS + duration.
+  #[default]
+  #[enum_value(name = "Timed", nick = "timed")]
+  Timed,
+  /// Buffers are persistent replacement states; only empty text clears.
+  #[enum_value(name = "Replacement", nick = "replacement")]
+  Replacement,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, glib::Enum)]
 #[enum_type(name = "GstFlvSubInjectMessageName")]
 pub enum MessageNameProperty {
@@ -104,6 +108,7 @@ impl From<MessageNameProperty> for MessageName {
 struct Settings {
   message_name: MessageNameProperty,
   late_policy: LatePolicy,
+  input_mode: InputMode,
   prime: bool,
 }
 
@@ -112,6 +117,7 @@ impl Default for Settings {
     Self {
       message_name: MessageNameProperty::default(),
       late_policy: LatePolicy::default(),
+      input_mode: InputMode::default(),
       prime: true,
     }
   }
@@ -134,17 +140,31 @@ const PRIMING_TEXT: &str = "\u{200b}";
 /// keeps a continuous fault visible without flooding at buffer rate.
 const INVARIANT_WARNING_INTERVAL: u64 = 1_000;
 
-/// A cue waiting for the FLV stream to reach its timestamp.
 #[derive(Clone, Debug)]
-struct PendingCue {
+enum TransitionKind {
+  Show { generation: u64, text: String },
+  /// `Some` is a timed cue's scheduled end; `None` is an explicit clear.
+  Clear { generation: Option<u64> },
+}
+
+/// A display-state transition waiting for muxed media to reach its timestamp.
+#[derive(Clone, Debug)]
+struct PendingTransition {
   running_time: gst::ClockTime,
+  sequence: u64,
+  kind: TransitionKind,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveState {
+  generation: u64,
   text: String,
 }
 
 #[derive(Default)]
 struct State {
-  /// Cues not yet written, ordered by running time.
-  pending: Vec<PendingCue>,
+  /// Transitions not yet applied, ordered by media time then arrival sequence.
+  pending: Vec<PendingTransition>,
   /// Segments observed on each sink pad, for running-time conversion.
   ///
   /// Both timelines must be expressed in the same domain before they can be
@@ -161,10 +181,15 @@ struct State {
   /// assuming both start at zero, silently skews whenever the muxer's first
   /// buffer does not.
   origin: Option<gst::ClockTime>,
-  /// Cues written, for diagnostics.
-  written: u64,
-  /// Cues discarded under [`LatePolicy::Drop`].
-  dropped: u64,
+  active: Option<ActiveState>,
+  next_generation: u64,
+  next_sequence: u64,
+  shows: u64,
+  clears: u64,
+  identical_suppressed: u64,
+  late_clamped: u64,
+  late_dropped: u64,
+  future_discarded: u64,
   /// Whether the priming cue has been written.
   primed: bool,
 }
@@ -217,19 +242,22 @@ impl FlvSubInject {
   ///    reference to the current tag position can land after a later-timestamped
   ///    A/V tag, so a consumer that trusts tag order mis-times it.
   fn handle_text_buffer(&self, buffer: &gst::Buffer) -> Result<gst::FlowSuccess, gst::FlowError> {
-    let Some(pts) = buffer.pts() else {
-      gst::warning!(CAT, imp = self, "text buffer without PTS, dropping");
-      return Ok(gst::FlowSuccess::Ok);
-    };
+    let pts = buffer.pts().ok_or_else(|| {
+      gst::error!(CAT, imp = self, "text buffer requires PTS");
+      gst::FlowError::Error
+    })?;
+    let duration = buffer.duration().ok_or_else(|| {
+      gst::error!(CAT, imp = self, "text buffer requires duration");
+      gst::FlowError::Error
+    })?;
 
     let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
-    let text = match std::str::from_utf8(map.as_slice()) {
-      Ok(text) => text.to_owned(),
-      Err(error) => {
-        gst::warning!(CAT, imp = self, "text buffer is not UTF-8: {error}");
-        return Ok(gst::FlowSuccess::Ok);
-      }
-    };
+    let text = std::str::from_utf8(map.as_slice())
+      .map_err(|error| {
+        gst::error!(CAT, imp = self, "text buffer is not UTF-8: {error}");
+        gst::FlowError::Error
+      })?
+      .to_owned();
 
     // AMF0 short strings cap at 64KB and `script_data_body` truncates to fit.
     // Silent truncation is a data-loss path, so it is surfaced here where the
@@ -244,18 +272,66 @@ impl FlvSubInject {
       );
     }
 
+    let input_mode = self.settings.lock().unwrap().input_mode;
     let mut state = self.state.lock().unwrap();
-    let running_time = State::running_time(state.text_segment.as_ref(), pts);
+    let start = State::running_time(state.text_segment.as_ref(), pts);
+    let generation = state.next_generation;
+    state.next_generation += 1;
+    let mut queue = |running_time: gst::ClockTime, kind: TransitionKind| {
+      let sequence = state.next_sequence;
+      state.next_sequence += 1;
+      state.pending.push(PendingTransition {
+        running_time,
+        sequence,
+        kind,
+      });
+    };
+
+    match input_mode {
+      InputMode::Timed => {
+        if text.is_empty() {
+          queue(start, TransitionKind::Clear { generation: None });
+        } else {
+          if duration.is_zero() {
+            gst::error!(CAT, imp = self, "timed non-empty text needs non-zero duration");
+            return Err(gst::FlowError::Error);
+          }
+          queue(
+            start,
+            TransitionKind::Show {
+              generation,
+              text,
+            },
+          );
+          queue(
+            start + duration,
+            TransitionKind::Clear {
+              generation: Some(generation),
+            },
+          );
+        }
+      }
+      InputMode::Replacement => {
+        let kind = if text.is_empty() {
+          TransitionKind::Clear { generation: None }
+        } else {
+          TransitionKind::Show {
+            generation,
+            text,
+          }
+        };
+        queue(start, kind);
+      }
+    }
+
     gst::log!(
       CAT,
       imp = self,
-      "queued cue at {running_time} ({} bytes)",
-      text.len()
+      "queued {input_mode:?} state at {start} for {duration}"
     );
-    state.pending.push(PendingCue { running_time, text });
     state
       .pending
-      .sort_by_key(|cue: &PendingCue| cue.running_time);
+      .sort_by_key(|transition| (transition.running_time, transition.sequence));
     Ok(gst::FlowSuccess::Ok)
   }
 
@@ -278,51 +354,90 @@ impl FlvSubInject {
     let settings = *self.settings.lock().unwrap();
 
     let position_ms = u64::from(state.stream_position_ms);
-    let mut tags = Vec::new();
+    let mut reached = Vec::new();
     let mut remaining = Vec::new();
-
-    for cue in std::mem::take(&mut state.pending) {
-      let cue_ms = cue
+    for transition in std::mem::take(&mut state.pending) {
+      let transition_ms = transition
         .running_time
         .saturating_sub(origin)
         .mseconds()
         .min(MAXIMUM_TIMESTAMP_MS);
-
-      if cue_ms > position_ms {
-        remaining.push(cue);
+      if transition_ms > position_ms {
+        remaining.push(transition);
         continue;
       }
 
-      // The cue's own time has passed. Whether that is "late" depends on
-      // whether the stream moved beyond it, which only matters for a consumer
-      // that has already served the range.
-      let timestamp_ms = if cue_ms < position_ms {
+      let timestamp_ms = if transition_ms < position_ms {
         match settings.late_policy {
           LatePolicy::Drop => {
-            state.dropped += 1;
+            state.late_dropped += 1;
             gst::debug!(
               CAT,
               imp = self,
-              "dropping cue {cue_ms}ms behind stream position {position_ms}ms"
+              "dropping transition {transition_ms}ms behind stream position {position_ms}ms"
             );
             continue;
           }
-          LatePolicy::Clamp => position_ms,
+          LatePolicy::Clamp => {
+            state.late_clamped += 1;
+            position_ms
+          }
         }
       } else {
-        cue_ms
+        transition_ms
       };
+      reached.push((timestamp_ms, transition.sequence, transition.kind));
+    }
+    state.pending = remaining;
 
-      let body = script_data_body(settings.message_name.into(), &cue.text, None);
-      let tag = script_data_tag(
-        u32::try_from(timestamp_ms).unwrap_or(u32::MAX),
-        &body,
-      );
-      state.written += 1;
+    // Apply every transition at a timestamp before serializing. Adjacent
+    // clear/show pairs and multiple updates reached on one media tag therefore
+    // expose only their final state, never a transient blank.
+    reached.sort_by_key(|(timestamp, sequence, _)| (*timestamp, *sequence));
+    let mut tags = Vec::new();
+    let mut cursor = 0;
+    while cursor < reached.len() {
+      let timestamp_ms = reached[cursor].0;
+      let visible_before = state.active.as_ref().map(|active| active.text.clone());
+      while cursor < reached.len() && reached[cursor].0 == timestamp_ms {
+        match &reached[cursor].2 {
+          TransitionKind::Show { generation, text } => {
+            state.active = Some(ActiveState {
+              generation: *generation,
+              text: text.clone(),
+            });
+          }
+          TransitionKind::Clear { generation } => {
+            // A clear belongs to the cue generation that scheduled it. An
+            // overlapping replacement has already taken ownership of display.
+            if generation.is_none()
+              || state
+                .active
+                .as_ref()
+                .is_some_and(|active| Some(active.generation) == *generation)
+            {
+              state.active = None;
+            }
+          }
+        }
+        cursor += 1;
+      }
+
+      let visible_after = state.active.as_ref().map(|active| active.text.clone());
+      if visible_before == visible_after {
+        state.identical_suppressed += 1;
+        continue;
+      }
+      let text = visible_after.unwrap_or_default();
+      if text.is_empty() {
+        state.clears += 1;
+      } else {
+        state.shows += 1;
+      }
+      let body = script_data_body(settings.message_name.into(), &text, None);
+      let tag = script_data_tag(u32::try_from(timestamp_ms).unwrap_or(u32::MAX), &body);
       tags.push(gst::Buffer::from_mut_slice(tag));
     }
-
-    state.pending = remaining;
     tags
   }
 
@@ -333,39 +448,29 @@ impl FlvSubInject {
     Ok(gst::FlowSuccess::Ok)
   }
 
-  /// Write every queued cue before the FLV stream ends.
+  /// Apply reached transitions and discard transitions beyond final media.
   ///
   /// Runs on the FLV streaming thread, from the EOS handler, so it preserves
   /// the single-writer invariant: EOS arrives on the same pad and thread that
   /// pushes buffers, and no chain call can be in flight beside it.
   ///
-  /// Cues are clamped to the final stream position rather than kept at their
-  /// own timestamps. A cue beyond the last media tag has no frame to sit
-  /// against, and a consumer resolving a cue's end from its successor would
-  /// otherwise be handed a cue that starts after the stream stopped.
   fn flush_pending_at_eos(&self) {
     let tags = {
       let mut state = self.state.lock().unwrap();
       if state.pending.is_empty() {
         return;
       }
-      let position = state.stream_position_ms;
-      let message_name = MessageName::from(self.settings.lock().unwrap().message_name);
-      let pending = std::mem::take(&mut state.pending);
+      let tags = self.drain_ready(&mut state);
+      let discarded = state.pending.len() as u64;
+      state.future_discarded += discarded;
+      state.pending.clear();
       gst::debug!(
         CAT,
         imp = self,
-        "draining {} queued cue(s) at EOS position {position}ms",
-        pending.len()
+        "applied {} reached transition(s) and discarded {discarded} future transition(s) at EOS",
+        tags.len()
       );
-      state.written += pending.len() as u64;
-      pending
-        .into_iter()
-        .map(|cue| {
-          let body = script_data_body(message_name, &cue.text, None);
-          gst::Buffer::from_mut_slice(script_data_tag(position, &body))
-        })
-        .collect::<Vec<_>>()
+      tags
     };
 
     if let Err(error) = self.push_tags(tags) {
@@ -640,6 +745,12 @@ impl ObjectImpl for FlvSubInject {
           .default_value(LatePolicy::default())
           .mutable_playing()
           .build(),
+        glib::ParamSpecEnum::builder::<InputMode>("input-mode")
+          .nick("Input mode")
+          .blurb("Interpret text buffers as timed intervals or persistent replacement states")
+          .default_value(InputMode::default())
+          .mutable_ready()
+          .build(),
         glib::ParamSpecBoolean::builder("prime")
           .nick("Prime subtitle stream")
           .blurb(
@@ -658,6 +769,7 @@ impl ObjectImpl for FlvSubInject {
     match pspec.name() {
       "message-name" => settings.message_name = value.get().expect("message-name"),
       "late-policy" => settings.late_policy = value.get().expect("late-policy"),
+      "input-mode" => settings.input_mode = value.get().expect("input-mode"),
       "prime" => settings.prime = value.get().expect("prime"),
       other => unimplemented!("set {other}"),
     }
@@ -668,6 +780,7 @@ impl ObjectImpl for FlvSubInject {
     match pspec.name() {
       "message-name" => settings.message_name.to_value(),
       "late-policy" => settings.late_policy.to_value(),
+      "input-mode" => settings.input_mode.to_value(),
       "prime" => settings.prime.to_value(),
       other => unimplemented!("get {other}"),
     }
@@ -744,9 +857,13 @@ impl ElementImpl for FlvSubInject {
       gst::debug!(
         CAT,
         imp = self,
-        "wrote {} cues, dropped {}, {} still queued",
-        state.written,
-        state.dropped,
+        "shows={}, clears={}, identical-suppressed={}, late-clamped={}, late-dropped={}, future-discarded={}, pending={}",
+        state.shows,
+        state.clears,
+        state.identical_suppressed,
+        state.late_clamped,
+        state.late_dropped,
+        state.future_discarded,
         state.pending.len()
       );
     }

@@ -107,6 +107,7 @@ fn produce_flv_with(muxer: &str, cues: &[(u64, &str)], prime: bool) -> Vec<u8> {
 
   let inject = gst::ElementFactory::make("flvsubinject")
     .property("prime", prime)
+    .property_from_str("input-mode", "replacement")
     .build()
     .unwrap();
   let sink = gst::ElementFactory::make("appsink")
@@ -129,10 +130,11 @@ fn produce_flv_with(muxer: &str, cues: &[(u64, &str)], prime: bool) -> Vec<u8> {
 
   for (millis, text) in cues {
     let mut buffer = gst::Buffer::from_slice(text.as_bytes().to_vec());
-    buffer
-      .get_mut()
-      .unwrap()
-      .set_pts(gst::ClockTime::from_mseconds(*millis));
+    {
+      let buffer = buffer.get_mut().unwrap();
+      buffer.set_pts(gst::ClockTime::from_mseconds(*millis));
+      buffer.set_duration(gst::ClockTime::from_mseconds(100));
+    }
     appsrc.push_buffer(buffer).unwrap();
   }
   appsrc.end_of_stream().unwrap();
