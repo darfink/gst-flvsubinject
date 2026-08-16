@@ -234,11 +234,6 @@ fn ffprobe_cues(flv: &[u8]) -> Vec<(i64, String)> {
     if text.chars().all(|character| character.is_control()) && !text.is_empty() {
       continue;
     }
-    // The priming cue declares the stream and renders as nothing; it is
-    // asserted directly in its own test rather than counted as content here.
-    if text == "\u{200b}" {
-      continue;
-    }
     cues.push((pts_ms, text));
   }
   cues
@@ -491,5 +486,31 @@ fn assert_primes(muxer: &str) {
   assert!(
     streams.contains("text"),
     "{muxer}: priming did not declare a subtitle stream: {streams:?}"
+  );
+
+  let packets = String::from_utf8_lossy(
+    &Command::new("ffprobe")
+      .args([
+        "-hide_banner", "-v", "error", "-select_streams", "s", "-show_entries",
+        "packet=pts_time,size", "-of", "csv=p=0", "-f", "flv", "-i", "pipe:0",
+      ])
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .spawn()
+      .and_then(|mut child| {
+        child.stdin.as_mut().unwrap().write_all(&primed)?;
+        child.wait_with_output()
+      })
+      .expect("ffprobe")
+      .stdout,
+  )
+  .trim()
+  .to_owned();
+
+  // The declaration must leave stateful consumers blank. A visually empty
+  // non-empty character would instead create an active, never-cleared state.
+  assert!(
+    packets.lines().next().is_some_and(|packet| packet == "0.000000,0"),
+    "{muxer}: priming subtitle packet was not empty: {packets:?}"
   );
 }

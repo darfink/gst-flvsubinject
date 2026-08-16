@@ -32,8 +32,8 @@
 //! as an empty text state. `textrollup` emits one at `clear-after`; ordinary
 //! timed cues get one scheduled from their duration in `input-mode=timed`.
 //!
-//! Priming uses U+200B rather than `""`: the priming state must render as
-//! nothing without being read as a clear transition.
+//! Priming uses an empty state: it declares the subtitle stream while leaving
+//! stateful consumers explicitly blank until the first real cue arrives.
 
 use std::sync::Mutex;
 
@@ -125,14 +125,10 @@ impl Default for Settings {
 
 /// Payload of the priming cue.
 ///
-/// Not the empty string. A consumer that republishes these cues as WebVTT has
-/// to reject empty cue text — WebVTT gives it no meaning, and a blank cue body
-/// terminates the cue — so priming with `""` trades an undiscoverable stream
-/// for a fatal muxing error further along.
-///
-/// U+200B ZERO WIDTH SPACE is a character for every validator that asks, and
-/// renders as nothing for every viewer that sees it.
-const PRIMING_TEXT: &str = "\u{200b}";
+/// Empty text is the same explicit blank state used for normal clears. This
+/// still makes the subtitle stream discoverable, without activating an
+/// invisible state that downstream consumers can mistake for a lost clear.
+const PRIMING_TEXT: &str = "";
 
 /// How often to repeat the one-tag-per-buffer warning once it starts firing.
 ///

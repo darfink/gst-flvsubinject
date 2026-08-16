@@ -111,14 +111,11 @@ Speech-derived captions always lose that race: the first cue cannot appear
 until someone has spoken and the recognizer has committed a word, which is
 seconds after any reasonable probe window closes.
 
-`prime` (default `true`) writes one invisible cue at the head of the stream to
+`prime` (default `true`) writes one empty state at the head of the stream to
 declare the timeline. It is the exact analogue of what CEA-708 does by sending
-null padding from the first frame, long before any caption text exists.
-
-The priming payload is U+200B ZERO WIDTH SPACE rather than the empty string: a
-consumer that republishes these cues as WebVTT has to reject empty cue text,
-so priming with `""` trades an undiscoverable stream for a fatal muxing error
-further along.
+null padding from the first frame, long before any caption text exists. Empty
+text is also the explicit clear representation, so a stateful consumer remains
+blank rather than tracking an invisible active cue until speech begins.
 
 ## Properties
 
@@ -202,10 +199,9 @@ cap the *consumer* chose: measured with a publisher clear at 10s against a 3s
 consumer cap, captions ended at exactly `start + 3s`, ignoring the publisher
 entirely.
 
-A consumer that does not implement this will treat an empty cue as an empty
-caption, or reject it outright — a blank body terminates a WebVTT cue. This is
-why priming uses U+200B rather than `""`: the priming cue must render as
-nothing *without* being read as a clear.
+A consumer that does not implement this may treat an empty cue as an empty
+caption or reject it outright. Consumers that support the replacement-state
+contract must treat it as an explicit blank state.
 
 ## Build
 
